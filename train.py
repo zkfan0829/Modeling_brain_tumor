@@ -6,12 +6,18 @@ Updates per your requests:
   `build_or_load_params` to construct `params_df`, then instantiates `BrainRigidDataset`.
 - Model & losses handle arbitrary input sizes; no fixed (256,256,256) asserts.
 - 7:1:2 split, clear epoch logs, checkpoint on best validation.
+
+Key entry points for navigation:
+- Training orchestration lives here in ``main`` (dataset -> loaders -> loops).
+- Rigid models: ``RigidRegCNN`` (model_cnn.py), ``RigidRegViT`` (model_vit3d.py),
+  and ``CrossModalAttnRigidRegressor`` (model_cross_attn.py).
+- Differentiable losses: registration losses plus ``DiceLoss`` for tumor masks in loss.py.
 """
 from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -22,8 +28,9 @@ import SimpleITK as sitk
 # --- Local modules ---
 from model_cnn import RigidRegCNN
 from model_vit3d import RigidRegViT
+from model_cross_attn import CrossModalAttnRigidRegressor
 
-from loss import soft_mutual_information_loss, mind_loss
+from loss import soft_mutual_information_loss, mind_loss, warp_image, DiceLoss
 
 from utils import *
 from utils import _unpack_sample , _normalize_shapes
@@ -52,6 +59,24 @@ INTERP = sitk.sitkLinear
 # Training / Eval
 # -----------------
 
+def _extract_tensor(batch: Any, key: str):
+    if isinstance(batch, dict) and key in batch:
+        val = batch[key]
+        if torch.is_tensor(val):
+            return val
+    return None
+
+
+def _forward_rigid(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Support models that either return Tensor or dict with ``rigid_params``."""
+    out = model(x)
+    if isinstance(out, dict):
+        if "rigid_params" not in out:
+            raise ValueError("Model dict output must contain 'rigid_params'.")
+        return out["rigid_params"]
+    return out
+
+
 def compute_losses(
     model: nn.Module,
     batch: Any,
@@ -63,6 +88,8 @@ def compute_losses(
     mind_down: int,
     spacing: Tuple[float, float, float],
     weights: Tuple[float, float, float],  # (w_mse, w_mi, w_mind)
+    dice_loss_fn: Optional[nn.Module] = None,
+    tumor_weight: float = 0.0,
 ):
     ct, mr, gt = _unpack_sample(batch)
     ct = ct.to(device)   # (B,1,D,H,W)
@@ -71,7 +98,7 @@ def compute_losses(
 
     # (B,2,D,H,W)
     x = torch.cat([ct, mr], dim=1)
-    pred = model(x)  # (B,6)
+    pred = _forward_rigid(model, x)  # (B,6)
 
     # MSE on params
     mse = F.mse_loss(pred, gt)
@@ -86,44 +113,98 @@ def compute_losses(
         "mse": float(mse.detach().cpu()),
         "mi": float(mi.detach().cpu()),
         "mind": float(mnd.detach().cpu()),
-        "total": float(total.detach().cpu()),
     }
+
+    tumor_loss = None
+    tumor_dice = None
+    if dice_loss_fn is not None and tumor_weight > 0.0:
+        tumor_fixed = _extract_tensor(batch, "tumor")
+        tumor_moving = _extract_tensor(batch, "tumor_moving")
+        tumor_flags = _extract_tensor(batch, "tumor_available")
+
+        if tumor_fixed is not None and tumor_moving is not None:
+            tumor_fixed = tumor_fixed.to(device)
+            tumor_moving = tumor_moving.to(device)
+            if tumor_flags is not None and torch.is_tensor(tumor_flags):
+                flags = tumor_flags.view(-1)
+                valid_idx = torch.nonzero(flags > 0, as_tuple=False).squeeze(1)
+            else:
+                valid_idx = torch.arange(tumor_fixed.shape[0], device=device)
+
+            if valid_idx.numel() > 0:
+                tumor_fixed = tumor_fixed.index_select(0, valid_idx.to(device))
+                tumor_moving = tumor_moving.index_select(0, valid_idx.to(device))
+                params_sel = pred.index_select(0, valid_idx.to(device))
+                warped = warp_image(tumor_moving, params_sel, spacing=spacing, mode="nearest")
+                tumor_loss = dice_loss_fn(warped, tumor_fixed)
+                total = total + tumor_weight * tumor_loss
+                tumor_dice = 1.0 - tumor_loss
+                metrics["tumor_loss"] = float(tumor_loss.detach().cpu())
+                metrics["tumor_dice"] = float(tumor_dice.detach().cpu())
+
+    metrics["total"] = float(total.detach().cpu())
     return total, metrics
+
+
+def _reduce_metrics(agg):
+    n = max(agg["n"], 1)
+    out = {
+        "mi": agg["mi"] / n,
+        "mse": agg["mse"] / n,
+        "mind": agg["mind"] / n,
+        "total": agg["total"] / n,
+    }
+    if agg["tumor_n"] > 0:
+        out["tumor_loss"] = agg["tumor_loss"] / agg["tumor_n"]
+        out["tumor_dice"] = agg["tumor_dice"] / agg["tumor_n"]
+    return out
 
 
 def train_one_epoch(model, loader, opt, device, cfg):
     model.train()
-    agg = {"mi": 0.0, "mse": 0.0, "mind": 0.0, "n": 0}
+    agg = {"mi": 0.0, "mse": 0.0, "mind": 0.0, "total": 0.0, "n": 0,
+           "tumor_loss": 0.0, "tumor_dice": 0.0, "tumor_n": 0}
 
     for batch in loader:
         opt.zero_grad(set_to_none=True)
         loss, m = compute_losses(
             model, batch, device,
             mi_bins=cfg.mi_bins, mi_sigma=cfg.mi_sigma, mi_samples=cfg.mi_samples,
-            mind_down=cfg.mind_down, spacing=cfg.spacing, weights=(cfg.w_mse, cfg.w_mi, cfg.w_mind)
+            mind_down=cfg.mind_down, spacing=cfg.spacing,
+            weights=(cfg.w_mse, cfg.w_mi, cfg.w_mind),
+            dice_loss_fn=cfg.dice_loss, tumor_weight=cfg.w_tumor,
         )
         loss.backward()
         opt.step()
 
-        agg["mi"] += m["mi"]; agg["mse"] += m["mse"]; agg["mind"] += m["mind"]; agg["n"] += 1
+        agg["mi"] += m["mi"]; agg["mse"] += m["mse"]; agg["mind"] += m["mind"]; agg["total"] += m["total"]; agg["n"] += 1
+        if "tumor_loss" in m:
+            agg["tumor_loss"] += m["tumor_loss"]
+            agg["tumor_dice"] += m.get("tumor_dice", 0.0)
+            agg["tumor_n"] += 1
 
-    n = max(agg["n"], 1)
-    return agg["mi"]/n, agg["mse"]/n, agg["mind"]/n
+    return _reduce_metrics(agg)
 
 
 def eval_epoch(model, loader, device, cfg):
     model.eval()
-    agg = {"mi": 0.0, "mse": 0.0, "mind": 0.0, "n": 0}
+    agg = {"mi": 0.0, "mse": 0.0, "mind": 0.0, "total": 0.0, "n": 0,
+           "tumor_loss": 0.0, "tumor_dice": 0.0, "tumor_n": 0}
     with torch.inference_mode():
         for batch in loader:
             loss, m = compute_losses(
                 model, batch, device,
                 mi_bins=cfg.mi_bins, mi_sigma=cfg.mi_sigma, mi_samples=cfg.mi_samples,
-                mind_down=cfg.mind_down, spacing=cfg.spacing, weights=(cfg.w_mse, cfg.w_mi, cfg.w_mind)
+                mind_down=cfg.mind_down, spacing=cfg.spacing,
+                weights=(cfg.w_mse, cfg.w_mi, cfg.w_mind),
+                dice_loss_fn=cfg.dice_loss, tumor_weight=cfg.w_tumor,
             )
-            agg["mi"] += m["mi"]; agg["mse"] += m["mse"]; agg["mind"] += m["mind"]; agg["n"] += 1
-    n = max(agg["n"], 1)
-    return agg["mi"]/n, agg["mse"]/n, agg["mind"]/n
+            agg["mi"] += m["mi"]; agg["mse"] += m["mse"]; agg["mind"] += m["mind"]; agg["total"] += m["total"]; agg["n"] += 1
+            if "tumor_loss" in m:
+                agg["tumor_loss"] += m["tumor_loss"]
+                agg["tumor_dice"] += m.get("tumor_dice", 0.0)
+                agg["tumor_n"] += 1
+    return _reduce_metrics(agg)
 
 def load_checkpoint(model: nn.Module, path: Path, device: torch.device) -> Dict[str, Any]:
     ckpt = torch.load(path, map_location=device)
@@ -142,6 +223,8 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    p.add_argument("--model", type=str, choices=("cnn", "vit", "cross_attn"), default="cnn",
+                   help="Backbone used for rigid regression.")
 
     # Loss hyperparams
     p.add_argument("--mi_bins", type=int, default=64)
@@ -155,6 +238,8 @@ def main():
     p.add_argument("--w_mse", type=float, default=1.0)
     p.add_argument("--w_mi", type=float, default=1.0)
     p.add_argument("--w_mind", type=float, default=1.0)
+    p.add_argument("--w_tumor", type=float, default=0.0,
+                   help="Weight for Dice loss between warped tumor masks.")
 
     args = p.parse_args()
 
@@ -183,13 +268,17 @@ def main():
     train_loader, val_loader, test_loader = make_loaders(dataset, args.batch_size, SEED, args.num_workers)
 
     # Model
-    model = RigidRegCNN().to(device)
-    #model = RigidRegViT(
-    #    embed_dim=192,      # divisible by 6
-    #    depth=12,           # ← use 12 like ViT-B
-    #    num_heads=12,        
-    #    patch_size=(16,16,16)
-    #    ).to(device)
+    if args.model == "cnn":
+        model = RigidRegCNN().to(device)
+    elif args.model == "vit":
+        model = RigidRegViT(
+            embed_dim=192,
+            depth=12,
+            num_heads=12,
+            patch_size=(16, 16, 16),
+        ).to(device)
+    else:
+        model = CrossModalAttnRigidRegressor().to(device)
     ckpt_path = Path(args.checkpoint_dir) / "best.pt"
     if ckpt_path.exists():
         ckpt = load_checkpoint(model, ckpt_path, device)
@@ -203,7 +292,9 @@ def main():
         ct, mr, _ = _unpack_sample(sample_batch)
         x = torch.cat([ct, mr], dim=1).to(device)  # (B,2,D,H,W)
         y = model(x)
-        if y.shape[-1] != 6:
+        if isinstance(y, dict):
+            y = y.get("rigid_params")
+        if y is None or y.shape[-1] != 6:
             raise RuntimeError(f"Model forward sanity check failed: expected last dim 6, got {tuple(y.shape)}")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -213,24 +304,36 @@ def main():
     best_val_total = float("inf")
     best_path = Path(args.checkpoint_dir) / "best.pt"
 
+    dice_loss_fn = DiceLoss().to(device)
+
     class Cfg:  # pack loss cfg
         mi_bins = args.mi_bins; mi_sigma = args.mi_sigma; mi_samples = args.mi_samples
         mind_down = args.mind_down; spacing = tuple(args.spacing)
-        w_mse = args.w_mse; w_mi = args.w_mi; w_mind = args.w_mind
+        w_mse = args.w_mse; w_mi = args.w_mi; w_mind = args.w_mind; w_tumor = args.w_tumor
+        dice_loss = dice_loss_fn
 
     for epoch in range(1, args.epochs + 1):
-        train_mi, train_mse, train_mind = train_one_epoch(model, train_loader, opt, device, Cfg)
-        val_mi, val_mse, val_mind = eval_epoch(model, val_loader, device, Cfg)
+        train_metrics = train_one_epoch(model, train_loader, opt, device, Cfg)
+        val_metrics = eval_epoch(model, val_loader, device, Cfg)
 
         # Total validation loss with same weights as training
-        val_total = args.w_mse * val_mse + args.w_mi * val_mi + args.w_mind * val_mind
+        val_total = (
+            args.w_mse * val_metrics["mse"]
+            + args.w_mi * val_metrics["mi"]
+            + args.w_mind * val_metrics["mind"]
+            + args.w_tumor * val_metrics.get("tumor_loss", 0.0)
+        )
         scheduler.step(val_total)
 
-        print(
-            f"Epoch {epoch}: "
-            f"Train MI Loss: {train_mi:.4f}, Train MSE: {train_mse:.4f}, Train MIND: {train_mind:.4f}, "
-            f"Val MI Loss: {val_mi:.4f}, Val MSE: {val_mse:.4f}, Val MIND: {val_mind:.4f}"
-        )
+        def _fmt(metrics, split):
+            base = (f"{split} MI: {metrics['mi']:.4f}, "
+                    f"{split} MSE: {metrics['mse']:.4f}, "
+                    f"{split} MIND: {metrics['mind']:.4f}")
+            if "tumor_loss" in metrics:
+                base += f", {split} TumorDiceLoss: {metrics['tumor_loss']:.4f} (Dice={metrics['tumor_dice']:.4f})"
+            return base
+
+        print(f"Epoch {epoch}: {_fmt(train_metrics, 'Train')} | {_fmt(val_metrics, 'Val')}")
 
         # Save on improvement
         if val_total < best_val_total:
@@ -255,10 +358,14 @@ def main():
             print(f"  ✔ Saved new best checkpoint to {best_path} (val_total={val_total:.4f})")
 
     # Final test evaluation
-    test_mi, test_mse, test_mind = eval_epoch(model, test_loader, device, Cfg)
-    print(
-        f"TEST: MI Loss: {test_mi:.4f}, MSE: {test_mse:.4f}, MIND: {test_mind:.4f}"
+    test_metrics = eval_epoch(model, test_loader, device, Cfg)
+    test_msg = (
+        f"TEST: MI Loss: {test_metrics['mi']:.4f}, MSE: {test_metrics['mse']:.4f}, "
+        f"MIND: {test_metrics['mind']:.4f}"
     )
+    if "tumor_loss" in test_metrics:
+        test_msg += f", TumorDiceLoss: {test_metrics['tumor_loss']:.4f} (Dice={test_metrics['tumor_dice']:.4f})"
+    print(test_msg)
 
 
 if __name__ == "__main__":

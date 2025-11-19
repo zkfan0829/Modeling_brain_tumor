@@ -5,6 +5,7 @@ Differentiable registration losses for rigid CT–MRI.
 Implemented losses:
 - soft_mutual_information_loss: differentiable MI via kernel-based soft histograms.
 - mind_loss: MIND-SSC descriptor L1 distance (3D).
+- DiceLoss: binary Dice loss for tumor supervision.
 
 Utilities:
 - params_to_affine and warp_image: convert 6 rigid params -> grid_sample warp.
@@ -127,6 +128,25 @@ def warp_image(
     grid = F.affine_grid(theta, size=moving.shape, align_corners=align_corners)
     warped = F.grid_sample(moving, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
     return warped
+
+
+class DiceLoss(nn.Module):
+    """Binary Dice loss. Inputs expected as probabilities/masks in [0,1]."""
+
+    def __init__(self, smooth: float = 1e-5) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if preds.shape != targets.shape:
+            raise ValueError(f"DiceLoss expects matching shapes, got {preds.shape} vs {targets.shape}")
+        B = preds.shape[0]
+        preds = preds.reshape(B, -1)
+        targets = targets.reshape(B, -1)
+        intersection = (preds * targets).sum(dim=1)
+        denom = preds.sum(dim=1) + targets.sum(dim=1)
+        dice = (2.0 * intersection + self.smooth) / (denom + self.smooth)
+        return 1.0 - dice.mean()
 
 
 def soft_mutual_information_loss(
