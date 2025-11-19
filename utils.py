@@ -243,8 +243,12 @@ def build_or_load_params(csv_summary="", csv_params="", num_per_case=5):
 # ======================
 class BrainRigidDataset(Dataset):
     """
-    Serves CT, moved-MR (transformed on-the-fly), CT brain mask, and rigid params/metadata.
-    Uses parameter rows from rigid_params.csv
+    Serves CT, moved-MR (transformed on-the-fly), CT brain mask, tumor masks, and rigid params.
+
+    Tumor supervision:
+      * ``tumor`` is always on the fixed CT grid.
+      * ``tumor_moving`` is the same mask warped with the synthetic transform applied to MRI.
+        Warping it back during training makes it easy to compute Dice loss in CT space.
     """
     def __init__(self, params_df: pd.DataFrame, target_size=(256, 256, 256), interp=sitk.sitkLinear):
         self.df = params_df.reset_index(drop=True)
@@ -301,12 +305,15 @@ class BrainRigidDataset(Dataset):
             
             # Tumor mask if available
             if tumor is not None:
-                tumor_res = sitk.Resample(tumor, ref, sitk.Transform(), sitk.sitkNearestNeighbor,   0,  sitk.sitkUInt8)
-                tumor_res = sitk.Cast(tumor_res > 0, sitk.sitkUInt8)
+                tumor_ct = sitk.Resample(tumor, ref, sitk.Transform(), sitk.sitkNearestNeighbor,   0,  sitk.sitkUInt8)
+                tumor_ct = sitk.Cast(tumor_ct > 0, sitk.sitkUInt8)
+                tumor_moving = sitk.Resample(tumor, ref, T, sitk.sitkNearestNeighbor,               0,  sitk.sitkUInt8)
+                tumor_moving = sitk.Cast(tumor_moving > 0, sitk.sitkUInt8)
             else:
-                tumor_res = None
+                tumor_ct = None
+                tumor_moving = None
 
-            ct, moved_mr, mask_out, tumor_out = ct_res, mr_res, mask_res, tumor_res
+            ct, moved_mr, mask_out, tumor_out, tumor_move_out = ct_res, mr_res, mask_res, tumor_ct, tumor_moving
         else:
             # keep original CT grid; move MR onto CT grid; ensure mask is on CT grid too
             mr_moved = sitk.Resample(mr, ct, T, self.interp, 0.0, mr.GetPixelID())
@@ -337,16 +344,26 @@ class BrainRigidDataset(Dataset):
                 else:
                     tumor_ct = tumor
                 tumor_ct = sitk.Cast(tumor_ct > 0, sitk.sitkUInt8)
+                tumor_moving = sitk.Resample(tumor_ct, ct, T, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+                tumor_moving = sitk.Cast(tumor_moving > 0, sitk.sitkUInt8)
             else:
                 tumor_ct = None
+                tumor_moving = None
 
-            ct, moved_mr, mask_out, tumor_out = ct, mr_moved, mask_ct, tumor_ct
+            ct, moved_mr, mask_out, tumor_out, tumor_move_out = ct, mr_moved, mask_ct, tumor_ct, tumor_moving
 
         # Convert to tensors
         ct_t   = sitk_to_torch(ct)              # [1, D, H, W], float32
         mr_t   = sitk_to_torch(moved_mr)        # [1, D, H, W], float32
         mask_t = sitk_to_torch_mask(mask_out)   # [1, D, H, W], float32 {0,1}
-        tumor_t = sitk_to_torch_mask(tumor_out) if tumor_out is not None else None  # or None
+        if tumor_out is not None and tumor_move_out is not None:
+            tumor_t = sitk_to_torch_mask(tumor_out)
+            tumor_moving_t = sitk_to_torch_mask(tumor_move_out)
+            has_tumor = True
+        else:
+            tumor_t = torch.zeros_like(ct_t)
+            tumor_moving_t = torch.zeros_like(ct_t)
+            has_tumor = False
 
         # Physical metadata (for logging or model use)
         meta = {
@@ -369,7 +386,9 @@ class BrainRigidDataset(Dataset):
             "ct": ct_t,                 # torch [1, D, H, W], float32
             "mr": mr_t,                 # torch [1, D, H, W], float32 (moved)
             "mask": mask_t,             # torch [1, D, H, W], float32 {0,1} (CT brain mask on same grid as ct/mr)
-            "tumor": tumor_t,           # torch [1, D, H, W], float32 {0,1} OR None
+            "tumor": tumor_t,           # torch [1, D, H, W], float32 {0,1}
+            "tumor_moving": tumor_moving_t,  # same shape, warped with MR transform
+            "tumor_available": torch.tensor(1 if has_tumor else 0, dtype=torch.uint8),
             "six_params": six,          # torch [6]
             "meta": meta
         }
