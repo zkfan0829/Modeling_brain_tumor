@@ -130,6 +130,42 @@ def warp_image(
     return warped
 
 
+def invert_affine(theta: torch.Tensor) -> torch.Tensor:
+    """Return the inverse of a batch of 3x4 affine matrices in homogeneous coords."""
+    if theta.ndim != 3 or theta.shape[1:] != (3, 4):
+        raise ValueError(f"theta must be (B,3,4); got {theta.shape}")
+    B = theta.shape[0]
+    pad = torch.tensor([0, 0, 0, 1], device=theta.device, dtype=theta.dtype).view(1, 1, 4).expand(B, -1, -1)
+    homo = torch.cat([theta, pad], dim=1)  # (B,4,4)
+    inv = torch.inverse(homo)
+    return inv[:, :3, :4]
+
+
+def warp_image_with_theta(
+    moving: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    mode: str = "bilinear",
+    padding_mode: str = "zeros",
+    align_corners: bool = True,
+) -> torch.Tensor:
+    """Warp `moving` using a precomputed normalized affine ``theta`` (B,3,4)."""
+    if moving.ndim != 5 or moving.shape[1] != 1:
+        raise ValueError(f"moving must be (B,1,D,H,W); got {tuple(moving.shape)}")
+    if theta.ndim != 3 or theta.shape[1:] != (3, 4):
+        raise ValueError(f"theta must be (B,3,4); got {theta.shape}")
+    grid = F.affine_grid(theta, size=moving.shape, align_corners=align_corners)
+    return F.grid_sample(moving, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+
+
+class DiceLoss(nn.Module):
+    """Binary Dice loss. Inputs expected as probabilities/masks in [0,1].
+
+    The formulation mirrors ``eval.py``'s DSC (2|A∩B|/(|A|+|B|)) while keeping a
+    small ``smooth`` term for numerical stability and differentiability. Masks
+    are treated as soft probabilities so gradients can flow through the warp
+    used for tumor supervision.
+    """
 class DiceLoss(nn.Module):
     """Binary Dice loss. Inputs expected as probabilities/masks in [0,1]."""
 

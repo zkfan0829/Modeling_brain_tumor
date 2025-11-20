@@ -30,6 +30,15 @@ from model_cnn import RigidRegCNN
 from model_vit3d import RigidRegViT
 from model_cross_attn import CrossModalAttnRigidRegressor
 
+from loss import (
+    soft_mutual_information_loss,
+    mind_loss,
+    warp_image,
+    DiceLoss,
+    params_to_affine,
+    invert_affine,
+    warp_image_with_theta,
+)
 from loss import soft_mutual_information_loss, mind_loss, warp_image, DiceLoss
 
 from utils import *
@@ -135,6 +144,16 @@ def compute_losses(
                 tumor_fixed = tumor_fixed.index_select(0, valid_idx.to(device))
                 tumor_moving = tumor_moving.index_select(0, valid_idx.to(device))
                 params_sel = pred.index_select(0, valid_idx.to(device))
+
+                # Use the inverse of the predicted transform so we bring the synthetic
+                # tumor_moving (T applied) back toward the original tumor on the CT grid,
+                # mirroring eval.py's "after_T_then_pred_inv" pathway.
+                _, _, D, H, W = tumor_moving.shape
+                theta = params_to_affine(params_sel, (D, H, W), spacing=spacing)
+                theta_inv = invert_affine(theta)
+                warped = warp_image_with_theta(
+                    tumor_moving, theta_inv, mode="nearest", padding_mode="zeros"
+                )
                 warped = warp_image(tumor_moving, params_sel, spacing=spacing, mode="nearest")
                 tumor_loss = dice_loss_fn(warped, tumor_fixed)
                 total = total + tumor_weight * tumor_loss
