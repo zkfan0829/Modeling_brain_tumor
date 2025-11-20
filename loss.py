@@ -5,6 +5,7 @@ Differentiable registration losses for rigid CT–MRI.
 Implemented losses:
 - soft_mutual_information_loss: differentiable MI via kernel-based soft histograms.
 - mind_loss: MIND-SSC descriptor L1 distance (3D).
+- DiceLoss: binary Dice loss for tumor supervision.
 
 Utilities:
 - params_to_affine and warp_image: convert 6 rigid params -> grid_sample warp.
@@ -127,6 +128,59 @@ def warp_image(
     grid = F.affine_grid(theta, size=moving.shape, align_corners=align_corners)
     warped = F.grid_sample(moving, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
     return warped
+
+
+def invert_affine(theta: torch.Tensor) -> torch.Tensor:
+    """Return the inverse of a batch of 3x4 affine matrices in homogeneous coords."""
+    if theta.ndim != 3 or theta.shape[1:] != (3, 4):
+        raise ValueError(f"theta must be (B,3,4); got {theta.shape}")
+    B = theta.shape[0]
+    pad = torch.tensor([0, 0, 0, 1], device=theta.device, dtype=theta.dtype).view(1, 1, 4).expand(B, -1, -1)
+    homo = torch.cat([theta, pad], dim=1)  # (B,4,4)
+    inv = torch.inverse(homo)
+    return inv[:, :3, :4]
+
+
+def warp_image_with_theta(
+    moving: torch.Tensor,
+    theta: torch.Tensor,
+    *,
+    mode: str = "bilinear",
+    padding_mode: str = "zeros",
+    align_corners: bool = True,
+) -> torch.Tensor:
+    """Warp `moving` using a precomputed normalized affine ``theta`` (B,3,4)."""
+    if moving.ndim != 5 or moving.shape[1] != 1:
+        raise ValueError(f"moving must be (B,1,D,H,W); got {tuple(moving.shape)}")
+    if theta.ndim != 3 or theta.shape[1:] != (3, 4):
+        raise ValueError(f"theta must be (B,3,4); got {theta.shape}")
+    grid = F.affine_grid(theta, size=moving.shape, align_corners=align_corners)
+    return F.grid_sample(moving, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+
+
+class DiceLoss(nn.Module):
+    """Binary Dice loss. Inputs expected as probabilities/masks in [0,1].
+
+    The formulation mirrors ``eval.py``'s DSC (2|A∩B|/(|A|+|B|)) while keeping a
+    small ``smooth`` term for numerical stability and differentiability. Masks
+    are treated as soft probabilities so gradients can flow through the warp
+    used for tumor supervision.
+    """
+
+    def __init__(self, smooth: float = 1e-5) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if preds.shape != targets.shape:
+            raise ValueError(f"DiceLoss expects matching shapes, got {preds.shape} vs {targets.shape}")
+        B = preds.shape[0]
+        preds = preds.reshape(B, -1)
+        targets = targets.reshape(B, -1)
+        intersection = (preds * targets).sum(dim=1)
+        denom = preds.sum(dim=1) + targets.sum(dim=1)
+        dice = (2.0 * intersection + self.smooth) / (denom + self.smooth)
+        return 1.0 - dice.mean()
 
 
 def soft_mutual_information_loss(
