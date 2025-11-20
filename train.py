@@ -39,6 +39,7 @@ from loss import (
     invert_affine,
     warp_image_with_theta,
 )
+from loss import soft_mutual_information_loss, mind_loss, warp_image, DiceLoss
 
 from utils import *
 from utils import _unpack_sample , _normalize_shapes
@@ -153,6 +154,7 @@ def compute_losses(
                 warped = warp_image_with_theta(
                     tumor_moving, theta_inv, mode="nearest", padding_mode="zeros"
                 )
+                warped = warp_image(tumor_moving, params_sel, spacing=spacing, mode="nearest")
                 tumor_loss = dice_loss_fn(warped, tumor_fixed)
                 total = total + tumor_weight * tumor_loss
                 tumor_dice = 1.0 - tumor_loss

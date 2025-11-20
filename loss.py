@@ -166,6 +166,8 @@ class DiceLoss(nn.Module):
     are treated as soft probabilities so gradients can flow through the warp
     used for tumor supervision.
     """
+class DiceLoss(nn.Module):
+    """Binary Dice loss. Inputs expected as probabilities/masks in [0,1]."""
 
     def __init__(self, smooth: float = 1e-5) -> None:
         super().__init__()
